@@ -1,39 +1,54 @@
 pipeline {
     agent any
-    
+
     tools {
         nodejs 'NodeJS LTS'
     }
-    
+
     environment {
         // Configurar variables de entorno para cada rama
         SERVER_DEV = '184.73.163.158'  // IP del servidor DEV
         SERVER_QA = '34.230.125.76'   // IP del servidor QA
         SERVER_PROD = '54.144.153.98' // IP del servidor PROD-MAIN
-        DEPLOY_USER = 'ubuntu'    // Usuario para SSH
-        APP_DIR = '/home/ubuntu/auth-service' // Directorio de la aplicación en el servidor
-        REPOSITORY = 'https://github.com/donetrmm/auth-service.git' // Repositorio Git
+        DEPLOY_USER = 'ubuntu'
+        APP_DIR = '/home/ubuntu/auth-service'
+        APP_REPO_URL = 'https://github.com/donetrmm/auth-service.git'
     }
-    
+
     stages {
-        stage('Checkout') {
+        stage('Clone App Repo') {
             steps {
-                checkout scm
+                script {
+                    // Limpiar workspace por si hay restos
+                    sh 'rm -rf app'
+                    // Clonar el repo de la app según la rama
+                    sh "git clone -b ${env.BRANCH_NAME} ${env.APP_REPO_URL} app"
+                }
             }
         }
-        
+
+        stage('List Files') {
+            steps {
+                dir('app') {
+                    sh 'ls -la'
+                }
+            }
+        }
+
         stage('Install Dependencies') {
             steps {
-                sh 'npm ci'
+                dir('app') {
+                    sh 'npm ci'
+                }
             }
         }
-             
+
         stage('Deploy') {
             steps {
                 script {
                     def targetServer = ''
                     def targetBranch = env.BRANCH_NAME
-                    
+
                     // Determinar el servidor según la rama
                     if (targetBranch == 'dev') {
                         targetServer = env.SERVER_DEV
@@ -41,50 +56,41 @@ pipeline {
                         targetServer = env.SERVER_QA
                     } else if (targetBranch == 'main') {
                         targetServer = env.SERVER_PROD
-                    } else if (targetBranch == "staging") {
-                        targetServer = env.SERVER_STAGING
                     } else {
                         echo "No se desplegará la rama: ${targetBranch}"
                         return
                     }
-                    
-                    // Desplegar en el servidor correspondiente
+
                     withCredentials([sshUserPrivateKey(credentialsId: 'server-ssh-key', keyFileVariable: 'SSH_KEY')]) {
                         sh """
                             ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no ${DEPLOY_USER}@${targetServer} '
                                 # Actualizar repositorios
                                 sudo apt update && sudo apt upgrade -y
 
-                                # Instalación de NVM y Node
-                                export NVM_DIR="\$HOME/.nvm"
-                                
                                 # Instalar NVM si no existe
+                                export NVM_DIR="\$HOME/.nvm"
                                 if [ ! -d "\$NVM_DIR" ]; then
                                     echo "Instalando NVM..."
                                     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
                                 fi
-                                
+
                                 # Cargar NVM
                                 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
                                 [ -s "\$NVM_DIR/bash_completion" ] && \\. "\$NVM_DIR/bash_completion"
-                                
+
                                 # Instalar Node LTS
                                 echo "Instalando Node.js LTS..."
                                 nvm install --lts
                                 nvm use --lts
-                                
+
                                 # Verificar versiones
-                                echo "Versión de Node.js:"
                                 node --version
-                                echo "Versión de NPM:"
                                 npm --version
-                                
+
                                 # Instalar PM2 globalmente
-                                echo "Instalando PM2..."
                                 npm install -g pm2
-                                echo "Versión de PM2:"
                                 pm2 --version
-                                
+
                                 # Instalar Git si no está presente
                                 if ! command -v git &> /dev/null; then
                                     sudo apt install -y git
@@ -93,10 +99,7 @@ pipeline {
                                 # Clonar o actualizar repositorio
                                 if [ ! -d ${APP_DIR} ]; then
                                     echo "Clonando repositorio..."
-                                    mkdir -p ${APP_DIR}
-                                    cd ${APP_DIR}
-                                    git clone ${REPOSITORY} .
-                                    git checkout ${targetBranch}
+                                    git clone -b ${targetBranch} ${env.APP_REPO_URL} ${APP_DIR}
                                 else
                                     echo "Actualizando repositorio..."
                                     cd ${APP_DIR}
@@ -104,35 +107,34 @@ pipeline {
                                     git checkout ${targetBranch}
                                     git pull origin ${targetBranch}
                                 fi
-                                
-                                # Asegurar que NVM está cargado para cada comando
+
+                                # Cargar NVM en el entorno de ejecución
                                 export NVM_DIR="\$HOME/.nvm"
                                 [ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
                                 nvm use --lts
-                                
-                                echo "Instalando dependencias..."
+
+                                # Instalar dependencias
+                                cd ${APP_DIR}
                                 npm ci
-                                
-                                # Revisar si existe script build antes de ejecutarlo
+
+                                # Compilar la aplicación NestJS
                                 if grep -q "\\\"build\\\"" package.json; then
                                     echo "Ejecutando build..."
                                     npm run build
                                 else
                                     echo "No hay script de build en package.json, omitiendo este paso"
                                 fi
-                                
-                                # Reiniciar con PM2
-                                echo "Configurando PM2..."
-                                if pm2 list | grep -q "node-healthcheck"; then
+
+                                # Reiniciar o iniciar con PM2
+                                if pm2 list | grep -q "nest-app"; then
                                     echo "Reiniciando aplicación con PM2..."
-                                    pm2 restart node-healthcheck
+                                    pm2 restart nest-app
                                 else
                                     echo "Iniciando aplicación con PM2 por primera vez..."
-                                    pm2 start npm --name "node-healthcheck" -- start
+                                    pm2 start dist/main.js --name "nest-app"
                                 fi
-                                
+
                                 # Guardar configuración de PM2
-                                echo "Guardando configuración de PM2..."
                                 pm2 save
                             '
                         """
@@ -141,7 +143,7 @@ pipeline {
             }
         }
     }
-    
+
     post {
         success {
             echo "Pipeline ejecutado con éxito!"
